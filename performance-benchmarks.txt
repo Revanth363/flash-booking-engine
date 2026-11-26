@@ -1,0 +1,11 @@
+These measure how the system behaves under increasing load.
+- Throughput and requests per second.
+- p50, p95 and p99 latency.
+- Database connection utilization.
+- Hot-seat contention.
+- General Admission contention.
+- CPU and memory usage.
+- Rejection latency.
+
+
+we have to compare several performance metrics to get honest results

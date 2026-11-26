@@ -1,0 +1,257 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - ARCHITECTURE DECISIONS & TRADE-OFFS
+================================================================================
+Document Status: LIVING ARCHITECTURE RECORD (Google SDE-1 Standards)
+Curriculum Alignment: 5-Day Master System Design (90%+ Concept Coverage)
+Format: Problem -> Alternatives -> Decision -> Trade-Offs -> Implementation Details
+
+--------------------------------------------------------------------------------
+ADR-01: Stateless Signed JWT vs Stateful Distributed Sessions [Day 1 & Day 2]
+--------------------------------------------------------------------------------
+Problem:
+How to authenticate 50,000 incoming requests/second without suffocating the data tier?
+
+Concepts Applied:
+- L7 Application Layer Auth Inspection
+- In-Memory Session Loss across Horizontal Nodes
+- Stateless Horizontal Scalability vs Distributed Redis Roundtrips (1-2ms network hop)
+
+Alternatives:
+1. Distributed Redis Session Store: Query Redis on every HTTP request. Adds network
+   hops and makes Redis a hard SPOF for auth.
+2. Sticky Sessions at Load Balancer: Breaks when nodes crash or scale; causes uneven load.
+3. Stateless Signed JWT: Validated in CPU memory in < 0.05ms without any network hop.
+
+Decision:
+Stateless signed JWT with short TTL (15 minutes). Role embedded in token claims (USER,
+OPERATOR, ADMIN, SYSTEM) for backend-enforced RBAC.
+
+Trade-off:
+Token revocation before expiry requires an explicit blacklist or short TTL. We mitigate
+this by setting TTL to 15 minutes, perfectly bounding the 10-minute flash sale window.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-02: Primary Key Strategy (UUIDv7 vs BIGSERIAL vs UUIDv4) [Day 2: B+Trees]
+--------------------------------------------------------------------------------
+Problem:
+Generating primary keys under extreme concurrent inserts without ID scraping attacks
+or B-tree disk fragmentation.
+
+Concepts Applied:
+- B+Tree Indexing Internals: Page splits, sequential vs random disk I/O
+- Security: Preventing enumeration attacks
+
+Alternatives:
+1. BIGSERIAL: Fast, sequential B-tree page fills, but reveals business metrics
+   (e.g., booking_id=1, booking_id=2).
+2. UUIDv4: Completely random. Causes catastrophic B+Tree page splits and random disk I/O.
+3. UUIDv7: Combines 48-bit UNIX millisecond timestamp + 74 bits of randomness.
+
+Decision:
+UUIDv7 generated in Go application memory before issuing SQL INSERT.
+Achieves sequential disk writes in PostgreSQL B+Trees while keeping IDs unguessable.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-03: Distributed Rate Limiting & Lua Atomicity [Day 1: Module 1.4]
+--------------------------------------------------------------------------------
+Problem:
+Protecting downstream services from bot scripts (1,000 req/s per client) and preventing
+distributed race conditions when requests hit multiple Go API Gateways.
+
+Concepts Applied:
+- Rate Limiting Algorithms: Token Bucket vs Sliding Window Log vs Leaky Bucket
+- Memory Footprint: Token Bucket (two numbers: timestamp + count) = 100 bytes/user
+- Concurrency Defect: Read-then-write race condition across multiple gateway instances
+- Single-threaded Redis Event Loop & Atomic Lua Execution
+
+Decision:
+Token Bucket algorithm executed via an atomic Redis Lua script.
+No distributed lock overhead. The lookup, replenishment math, and consumption run in
+a single atomic thread inside Redis.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-04: Redis Out-of-Memory (OOM) & Cache Eviction Strategy [Day 3: Module 3.1]
+--------------------------------------------------------------------------------
+Problem:
+What happens when Redis or local L1 cache runs out of memory (100% RAM utilization)
+under 50,000 users competing for event/seat data?
+
+Concepts Applied:
+- Cache Eviction Algorithms:
+  * LRU (Least Recently Used): Evicts oldest access; vulnerable to scan pollution.
+  * LFU (Least Frequently Used): Evicts lowest frequency; vulnerable to historical bias (dead hotkeys).
+  * ARC (Adaptive Replacement Cache): Dynamically self-tunes between LRU and LFU using ghost lists.
+  * Window TinyLFU (W-TinyLFU): State-of-the-art hybrid eviction used in high-throughput engines.
+    Uses a small LRU Window (1% RAM) to absorb sudden bursts, combined with a Count-Min Sketch
+    frequency filter (probabilistic 4-bit counters with periodic halving/decay) to compare new
+    candidates against eviction victims in the Main Segmented LRU cache.
+- Redis maxmemory-policy: volatile-lru vs allkeys-lru vs noeviction
+- Segregation of Ephemeral Caches vs Critical Atomic Counters
+
+Engineering Strategy for "Cache / Redis is Full":
+1. L1 Application In-Memory Cache (Go Engine):
+   - Employs W-TinyLFU eviction semantics (via Go Ristretto or custom bounded cache).
+   - High hit-ratio guarantee: Prevents sudden one-off scan requests from evicting
+     critical hot event metadata and seat layout baselines.
+2. L2 Distributed Redis Tier:
+   - Key Separation by Business Criticality:
+     * Category A (Evictable Hot Reads): Cached seat maps, event metadata.
+       Stored with explicit TTL + maxmemory-policy: volatile-lru (or allkeys-lru). If RAM is full,
+       Redis safely evicts old seat maps; the app falls back to Cache-Aside DB reads.
+     * Category B (Non-Evictable State): Active rate-limit tokens, idempotency locks.
+       Stored in a dedicated Redis instance or protected keyspace with 'noeviction' to
+       prevent dropping security guards.
+3. Graceful Degradation / Memory Pressure Circuit Breaker:
+   - Go app monitors Redis memory via INFO memory.
+   - If Redis memory reaches 90% threshold, the Go gateway trips an in-memory
+     local fallback: degrades to local Go token bucket (sync.Map / golang.org/x/time/rate)
+     to prevent Redis crashing or dropping writes.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-05: Cache Failure Mitigations [Day 3: Module 3.1]
+--------------------------------------------------------------------------------
+Problem:
+Protecting PostgreSQL from Cache Stampedes, Penetration, and Avalanches.
+
+Concepts Applied:
+- Cache Stampede (Thundering Herd): 50,000 requests miss expired cache simultaneously.
+  Solution: Singleflight / Mutex locking in Go (`golang.org/x/sync/singleflight`).
+  Only 1 request queries the DB; the other 49,999 wait and share the single result.
+- Cache Penetration: Malicious requests for non-existent IDs (e.g., seat_id = -9999).
+  Solution: Cache Null/Placeholder values in Redis with short TTL (30s) + Bloom Filter.
+- Cache Avalanche: Keys expiring at the same second.
+  Solution: Add Jitter to TTL (TTL = 600s + random(0, 60s)).
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-06: Payment Idempotency Engine [Day 4: Module 4.2]
+--------------------------------------------------------------------------------
+Problem:
+Network timeouts cause users or gateways to retry payments, risking duplicate charges.
+
+Concepts Applied:
+- API Idempotency: Idempotency-Key header (UUIDv4)
+- Atomic SETNX in Redis (Phase 2) / Database Unique Constraint (Phase 1)
+- State Machine: IN_PROGRESS -> COMPLETED / FAILED
+
+Decision:
+PostgreSQL `idempotency_keys` table with unique constraint on `idempotency_key`.
+Client sends `Idempotency-Key: <UUID>`. If retried with same key, Go returns the cached
+HTTP response payload without re-executing charges.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-07: In-Doubt Payment Reconciliation [Day 4: Module 4.2]
+--------------------------------------------------------------------------------
+Problem:
+Gateway times out after 5 seconds. System cannot determine if money was deducted.
+
+Concepts Applied:
+- Distributed partial failures & uncertain states
+- Asynchronous reconciliation worker with Exponential Backoff + Jitter
+
+Decision:
+Payment marked `PAYMENT_PENDING / IN_DOUBT`. Background worker polls gateway
+inquiry API (`GET /gateway/transactions/{id}`) using formula:
+  t_wait = base * 2^attempt + jitter
+Resolves ground truth safely without stranding customer money.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-08: Fencing Tokens Against Zombie Workers [Day 4: Module 4.1]
+--------------------------------------------------------------------------------
+Problem:
+Worker holds a 10-minute hold lock, gets paused for 11 minutes by a Stop-The-World GC
+or network freeze. Lock expires; User 2 takes the seat. Zombie Worker wakes up and tries
+to mark the seat booked by User 1, corrupting the database.
+
+Concepts Applied:
+- The Distributed Lock Pause Problem
+- Monotonically Increasing Fencing Tokens
+
+Decision:
+The database maintains an integer `version` column acting as a Fencing Token.
+Every write conditionally checks:
+  UPDATE bookings SET status = $new_status, version = version + 1
+  WHERE id = $id AND version = $expected_version;
+If the zombie worker wakes up with stale version 101, PostgreSQL rejects the write
+because the current database token is already 102.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-09: Distributed Sagas vs Two-Phase Commit (2PC) [Day 4: Module 4.2]
+--------------------------------------------------------------------------------
+Problem:
+Multi-step booking flow (Reserve Seat -> Charge Payment -> Emit Confirmation) across
+distributed boundaries.
+
+Concepts Applied:
+- 2PC Blocking Architecture flaw: Coordinator crash locks tables indefinitely.
+- Orchestrated Saga Pattern: Local transactions with Compensating Actions.
+
+Decision:
+Phase 1 uses single-database ACID boundaries.
+Phase 2 uses Orchestrated Saga: If payment fails or expiration wins, compensating
+transactions trigger automated refunds (`REFUND_PENDING -> REFUNDED`) and release seats.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-10: Asynchronous Event Streaming & Transactional Outbox [Day 3: Kafka & Day 4]
+--------------------------------------------------------------------------------
+Problem:
+Publishing booking events to Kafka directly inside HTTP handlers creates dual-write failure:
+DB commits, but Kafka fails -> Event lost! Or Kafka publishes, but DB rolls back -> Ghost event!
+
+Concepts Applied:
+- Transactional Outbox Pattern
+- Kafka Partitioning: Keyed on `booking_id` for strict sequence ordering
+- Consumer Groups & Idempotent Consumer Pattern (At-Least-Once Delivery -> Exactly-Once)
+
+Decision:
+Go writes booking state mutation and outbox event into PostgreSQL in the SAME transaction.
+An independent background Outbox Relay reads uncommitted events and publishes to Kafka.
+Consumers process events idempotently using message deduplication.
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-11: Authoritative Central Database Clock [Scenario 22]
+--------------------------------------------------------------------------------
+Problem:
+Host VM clock drift (NTP desync) between Go nodes causes premature hold expiration.
+
+Decision:
+Never use Go host `time.Now()` for business expiry. All expirations rely strictly
+on PostgreSQL's authoritative server clock (`NOW()` / `CURRENT_TIMESTAMP`).
+Status: [DESIGNED]
+
+--------------------------------------------------------------------------------
+ADR-12: Zero-DB Application Logging Architecture (SOTA Observability)
+--------------------------------------------------------------------------------
+Problem:
+Writing 50,000 HTTP access and application log entries/second directly into PostgreSQL
+exhausts database Write-Ahead Log (WAL) bandwidth, starves connection pools, and ruins disk IOPS.
+
+Alternatives:
+  1. PostgreSQL Logging Table: Direct SQL inserts for every log. Catastrophic performance
+     degradation and disk bloat under high throughput.
+  2. Synchronous External HTTP Logging: Blocking network calls to a remote logging server on
+     every incoming request. Adds severe latency and creates external SPOF.
+  3. High-Speed Local File/Stream Pipeline (SOTA): Asynchronous zero-allocation Go logging
+     to rotating files/stdout -> Vector/Promtail -> Grafana Loki.
+
+Decision:
+Zero database writes for application/network logs:
+  - In-App Logging: Standard library `log/slog` (or `uber-go/zap`) producing structured JSON.
+  - Streaming Sink: Asynchronous buffered stdout and local rotating disk files (via `lumberjack`).
+  - Log Shipper: Vector (or Grafana Promtail) tailing the rotating log files out-of-process.
+  - Centralized Store: Grafana Loki (index-free, compressed raw chunks, ultra-lightweight).
+
+Crucial Distinction:
+  - Application Logs (traces, latency, debug, HTTP access): Handled strictly via ADR-12 (zero DB).
+  - Financial & State Audit Trail: Recorded in the append-only `audit_logs` table because
+    cryptographic state transitions must commit in the exact same ACID transaction as the booking mutation.
+Status: [DESIGNED]

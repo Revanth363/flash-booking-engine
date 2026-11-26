@@ -1,0 +1,42 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - APPLICATION ARCHITECTURE & DOMAIN DESIGN
+================================================================================
+Document Status: IMPLEMENTED & VERIFIED (Google SDE-1 Standards)
+Module: application_2/
+
+1. DOMAIN BOUNDARIES & CLEAN ARCHITECTURE
+--------------------------------------------------------------------------------
+The application is organized into 4 distinct layers:
+- domain/: Pure business logic, entity structs, and state transition invariants.
+  Zero external database or network dependencies.
+- repository/: PostgreSQL transaction management, row-level locking, and DDL mappings.
+- services/: Use-case orchestration (AuthService, BookingService).
+- api/: HTTP transport layer, request validation, JWT authentication middleware,
+  and admission control semaphores.
+
+2. FINITE STATE MACHINE (FSM) RULES
+--------------------------------------------------------------------------------
+State Enum: HELD, PAID, CONFIRMED, EXPIRED, CANCELLED, REFUND_PENDING, REFUNDED.
+
+Permitted Transitions:
+- HELD -> PAID (upon successful payment gateway charge)
+- HELD -> EXPIRED (upon 10-minute timer expiration by background worker)
+- HELD -> CANCELLED (user explicit cancellation before payment)
+- PAID -> CONFIRMED (successful settlement of seats and tickets)
+- PAID -> REFUND_PENDING (if payment charged after hold expired or was cancelled)
+- CONFIRMED -> REFUND_PENDING (administrative dispute or operational cancellation)
+- REFUND_PENDING -> REFUNDED (gateway confirms refund credit)
+
+Forbidden Transitions (Rejection Guaranteed):
+- HELD -> CONFIRMED (cannot bypass payment verification)
+- EXPIRED -> PAID (cannot pay for an already released seat)
+- CANCELLED -> PAID (cannot pay for a voluntarily abandoned hold)
+- REFUNDED -> any state (terminal state)
+
+3. STATEFUL VERSIONING & FENCING TOKENS
+--------------------------------------------------------------------------------
+Every booking record carries an integer version column initialized to 1.
+Every state transition unconditionally increments the version:
+  UPDATE bookings SET status = $next_status, version = version + 1
+  WHERE booking_id = $id AND version = $current_version;
+Eliminates lost-update anomalies and protects against stale, delayed threads.

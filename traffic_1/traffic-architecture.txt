@@ -1,0 +1,32 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - TRAFFIC ARCHITECTURE & EDGE INGRESS
+================================================================================
+Document Status: IMPLEMENTED (Google SDE-1 Standards)
+Component: Layer 7 Reverse Proxy & Ingress Buffer (Nginx)
+
+1. WHY NGINX SITS IN FRONT OF GO
+--------------------------------------------------------------------------------
+1. Slowloris & Slow Client Mitigation [Scenario 23]:
+   Clients trickle bytes over slow mobile networks. Nginx buffers full client
+   request headers and bodies in memory before forwarding complete requests
+   to Go over local TCP keep-alive connections. Prevents leaking Go goroutines.
+2. Connection Keep-Alive Pooling:
+   Nginx maintains persistent upstream keep-alive connections to Go instances
+   (keepalive 64), eliminating TCP handshake overhead under high QPS.
+3. Perimeter Rate Limiting [Scenario 21]:
+   - Token bucket rate limiting: 10 req/sec per client IP with a burst of 20.
+   - Nodelay enforcement: Excess burst requests are shed immediately with
+     HTTP 429 Too Many Requests before reaching Go application memory.
+4. Load Balancing & Failover:
+   - Uses least_conn algorithm to route requests to the least busy Go replica.
+   - Automatically marks failed replicas unhealthy (max_fails=3 fail_timeout=5s).
+
+2. CONFIGURATION PARAMETERS (traffic_1/nginx.conf)
+--------------------------------------------------------------------------------
+- Worker Connections: 10,240 concurrent connections using epoll
+- Client Header Timeout: 2s (kills slowloris header trickles)
+- Client Body Timeout: 3s
+- Upstream Connect Timeout: 1s
+- Upstream Read Timeout: 4s
+- Upstream Target: http://host.docker.internal:8080 (Go Application)
+- Resource Limits: 1.0 CPU, 512MB RAM

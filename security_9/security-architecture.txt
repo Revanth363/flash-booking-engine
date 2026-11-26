@@ -1,0 +1,44 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - SECURITY ARCHITECTURE & THREAT MODEL
+================================================================================
+Document Status: APPROVED BASELINE (Google SDE-1 Standards)
+Domain: OWASP Top 10, Authentication, Authorization, and Abuse Mitigation
+
+1. AUTHENTICATION & TOKEN SECURITY
+--------------------------------------------------------------------------------
+- Password Hashing: bcrypt with DefaultCost (work factor 10) to defend against
+  rainbow tables and offline dictionary brute-force attacks.
+- Stateless Signed JWT: HS256 with cryptographically strong secret.
+  Strict algorithm verification: Rejects "alg": "none" and unapproved signing methods.
+- Short-Lived Access Tokens (15 Minutes): Matches the 10-minute hold window.
+  Minimizes vulnerability window if an access token is leaked.
+- Opaque Refresh Tokens: 32-byte cryptographically secure random bytes (crypto/rand),
+  stored SHA-256 hashed in PostgreSQL.
+
+2. AUTHORIZATION & OWNERSHIP ENFORCEMENT
+--------------------------------------------------------------------------------
+- Ownership Verification: User identity is extracted strictly from the validated
+  JWT context inside Go memory. Client cannot supply or spoof user_id in payloads.
+- State Machine Authorization: Users can only trigger legal transitions (e.g. HELD -> PAID).
+  Workers and system processes enforce state locks independently.
+
+3. SQL INJECTION PREVENTION
+--------------------------------------------------------------------------------
+- 100% Parameterized Queries: All database operations use pgx prepared statements
+  and parameter placeholders ($1, $2, $3).
+- Zero String Concatenation: Raw SQL string formatting is strictly prohibited across
+  all repository and migration code.
+
+4. RATE LIMITING & ABUSE MITIGATION
+--------------------------------------------------------------------------------
+- Edge Token-Bucket (Nginx): 10 requests/sec per IP, burst limit of 20.
+  Protects against high-frequency bot scrapers and brute-force login attacks.
+- Per-User Active Hold Quota: Maximum 1 active HELD booking per user ID.
+  Prevents scalper cart-hoarding scripts from monopolizing inventory.
+
+5. SECURITY HEADERS (HTTP LEVEL)
+--------------------------------------------------------------------------------
+- X-Content-Type-Options: nosniff
+- X-Frame-Options: DENY
+- Content-Security-Policy: default-src 'none'
+- Strict-Transport-Security: max-age=63072000; includeSubDomains (production TLS)

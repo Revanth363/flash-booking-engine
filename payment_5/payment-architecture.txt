@@ -1,0 +1,44 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - PAYMENT ARCHITECTURE & IDEMPOTENCY
+================================================================================
+Document Status: IMPLEMENTED & VERIFIED (Google SDE-1 Standards)
+Module: payment_5/
+
+1. API IDEMPOTENCY ENGINE (ADR-06 & Scenario 8)
+--------------------------------------------------------------------------------
+Problem:
+Network dropped packets cause clients to retry payment requests, risking duplicate charges.
+
+Architecture:
+- Client generates unique Idempotency-Key (UUIDv4) header.
+- IdempotencyManager checks PostgreSQL idempotency_keys table:
+  1. If key exists and status == 'COMPLETED':
+     Returns cached HTTP status code and JSON response body instantly (< 1ms).
+  2. If key exists and status == 'IN_PROGRESS':
+     Returns HTTP 409 Conflict (Concurrent in-flight operation).
+  3. If key does not exist:
+     Atomically inserts status = 'IN_PROGRESS' with SHA-256 hash of payload.
+     After transaction commits, updates record to status = 'COMPLETED'.
+
+2. PAYMENT VS. EXPIRATION RACE ARBITER (Scenario 7)
+--------------------------------------------------------------------------------
+Problem:
+User pays at minute 09:59.800. Gateway responds at 10:00.100.
+Expiration worker marked booking EXPIRED at 10:00.000.
+
+Resolution:
+When payment gateway succeeds:
+1. Transaction acquires booking row lock: SELECT ... FOR UPDATE.
+2. If booking.Status != 'HELD' OR booking.IsExpiredAt(NOW()):
+   - Detects money was charged but hold window expired.
+   - Inserts record into payments (status = 'SUCCESS').
+   - Inserts record into refunds (status = 'REFUND_PENDING', reason = 'Hold expired').
+   - Calls gateway.Refund() immediately.
+   - User is never left charged without a confirmed ticket.
+
+3. IN-DOUBT PAYMENT TRACKING (ADR-07 & Scenario 13)
+--------------------------------------------------------------------------------
+When gateway call encounters network timeout (5s delay):
+- Payment recorded as status = 'IN_DOUBT'.
+- Booking is neither confirmed nor prematurely cancelled.
+- Handled asynchronously by the background reconciliation worker.

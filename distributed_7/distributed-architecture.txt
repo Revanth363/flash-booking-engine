@@ -1,0 +1,37 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - DISTRIBUTED ARCHITECTURE BLUEPRINT (PHASE 2)
+================================================================================
+Document Status: BLUEPRINT & STUB READY (Google SDE-1 Standards)
+Module: distributed_7/
+
+1. ROLE OF REDIS IN PHASE 2
+--------------------------------------------------------------------------------
+- Client Stub: Initialized in distributed_7/redis_client.go with connection pooling.
+- Redis Token-Bucket Rate Limiter:
+  Atomic Lua script executing rate limit checks across multiple Go nodes.
+- Distributed Read Cache (Cache-Aside):
+  Caches event seat maps and event metadata with 2-second TTL + jitter.
+  Absorbs 95%+ of seat map refresh spikes during flash drops.
+- Memory Pressure & Eviction Policy:
+  * Seat Map Caches: volatile-lru (evictable under memory pressure).
+  * Rate Limit Keys: noeviction (protected security keyspace).
+
+2. TRANSACTIONAL OUTBOX & APACHE KAFKA
+--------------------------------------------------------------------------------
+Problem:
+Dual-write anomaly when writing to database and publishing to Kafka.
+
+Phase 2 Architecture:
+1. Go transaction writes business state change and outbox event in the SAME ACID commit.
+2. Outbox Relay worker polls committed outbox records:
+   SELECT outbox_id, aggregate_id, event_type, payload 
+   FROM outbox_events WHERE status = 'PENDING' LIMIT 50 FOR UPDATE SKIP LOCKED;
+3. Publishes event to Apache Kafka topic (partitioned by booking_id for strict order).
+4. Updates outbox record status to 'PUBLISHED'.
+
+3. INBOX DEDUPLICATION PATTERN
+--------------------------------------------------------------------------------
+Downstream consumers track processed message IDs:
+  INSERT INTO inbox_events (inbox_id, consumer_name, event_id, status, processed_at)
+  VALUES ($1, $consumer, $event_id, 'PROCESSED', CURRENT_TIMESTAMP);
+Guarantees effectively-once processing over at-least-once Kafka message streams.

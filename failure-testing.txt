@@ -1,0 +1,68 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - FAILURE & CHAOS TESTING SPECIFICATION
+================================================================================
+Document Status: EXPERIMENTAL TEST PLAN
+Goal: Prove system resilience under crashes, network drops, and resource exhaustion.
+
+--------------------------------------------------------------------------------
+FT-01: Worker Crash Mid-Sweep Recovery [Scenario 11]
+--------------------------------------------------------------------------------
+Test Scenario:
+- Seed database with 50 expired HELD bookings.
+- Start the background Expiration Worker.
+- Send SIGKILL (kill -9) to the worker process when 25 seats have been processed.
+- Observe: Are the remaining 25 seats locked forever?
+- Action: Restart the worker process.
+- Acceptance Criteria:
+  * Worker resumes automatically, detects remaining 25 expired bookings, releases them.
+  * Zero orphaned locks, zero manual DB intervention required.
+Status: [UNTESTED]
+
+--------------------------------------------------------------------------------
+FT-02: Client Disconnect & Context Cancellation [Scenario 12]
+--------------------------------------------------------------------------------
+Test Scenario:
+- Client initiates POST /bookings/hold for Seat A1.
+- Introduce artificial 500ms delay in DB transaction.
+- Client abruptly closes TCP connection at 100ms (client abort).
+- Acceptance Criteria:
+  * Go net/http triggers ctx.Done().
+  * pgx detects context cancellation, aborts SQL query immediately.
+  * DB transaction is rolled back; Seat A1 remains AVAILABLE.
+  * Zero CPU/DB resources wasted completing abandoned request.
+Status: [UNTESTED]
+
+--------------------------------------------------------------------------------
+FT-03: Database Connection Pool Exhaustion [Scenario 17]
+--------------------------------------------------------------------------------
+Test Scenario:
+- Set pgx pool max connections to 10 (N_conn = 10).
+- Bombard Go server with 1,000 concurrent booking requests.
+- Acceptance Criteria:
+  * Bounded connection acquisition timeout (e.g., 200ms).
+  * Requests waiting > 200ms fail fast with HTTP 503 (Server Busy) rather than queuing
+    in Go memory indefinitely.
+  * Go server memory remains stable (zero OOM crash).
+Status: [UNTESTED]
+
+--------------------------------------------------------------------------------
+FT-04: Node Health & Database Disconnection [Scenario 20]
+--------------------------------------------------------------------------------
+Test Scenario:
+- Run 2 Go application nodes behind Nginx.
+- Cut network access to PostgreSQL from Node 1 (docker network disconnect).
+- Acceptance Criteria:
+  * Node 1's /healthz and /readyz probes fail within 1 second.
+  * Nginx immediately stops routing traffic to Node 1.
+  * Node 2 serves 100% of traffic with zero client-visible dropped queries.
+Status: [UNTESTED]
+
+--------------------------------------------------------------------------------
+FT-05: Slowloris & Slow HTTP Client Mitigation [Scenario 23]
+--------------------------------------------------------------------------------
+Test Scenario:
+- Launch 2,000 mock slow clients that send HTTP headers at 1 byte every 5 seconds.
+- Acceptance Criteria:
+  * Go server's ReadHeaderTimeout (1s) and ReadTimeout (2s) fire.
+  * Sockets closed cleanly; goroutine count does not leak.
+Status: [UNTESTED]

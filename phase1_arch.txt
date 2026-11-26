@@ -1,0 +1,65 @@
+[User / Mobile App / Bot]
+         │
+         │  1. HTTP Request (e.g. POST /api/v1/bookings/hold)
+         ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1: EDGE INGRESS & TRAFFIC DEFENSE (traffic_1)                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ • Slowloris Shield: Buffers headers & body within strict 2s timeout.   │
+│ • Token-Bucket Rate Limiter: Checks IP rate (10 req/s, burst 20).      │
+│   -> If exceeded: Rejects immediately with HTTP 429 (Zero Go load).    │
+│ • Reverse Proxy: Forwards complete request over keep-alive TCP to Go.  │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2: APPLICATION ADMISSION & AUTH GUARD (application_2 & security_9)│
+├────────────────────────────────────────────────────────────────────────┤
+│ • Layer 1 Admission Gate: Non-blocking Go Semaphore (8 slots).         │
+│   -> If full: Fails fast with HTTP 503 (Retry-After: 1s) in < 0.01ms.  │
+│ • Auth Middleware: Extracts Bearer JWT token from header.              │
+│   -> Cryptographically verifies HMAC signature in RAM (< 0.05ms).      │
+│   -> Extracts UserID into request context (Zero spoofing).             │
+│ • Pre-Sale Clamp Check: Rejects if sale start time has not arrived.   │
+│ • Active-Hold Quota Check: Rejects if user already holds a seat.       │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ STAGE 3: CONCURRENCY ARBITER & LOCKING (concurrency_4 & database_3)    │
+├────────────────────────────────────────────────────────────────────────┤
+│ • Connection Pool: Acquires connection from pgxpool with 50ms deadline.│
+│ • Canonical Sorting: Sorts seat IDs (A1, A2) to prevent deadlocks.    │
+│ • Pessimistic Row Lock (SELECT ... FOR UPDATE NOWAIT):                 │
+│   -> Contestant #1 wins row lock in < 2ms.                             │
+│   -> Contestants #2 to #1,000 get 55P03 -> Fail fast with HTTP 409.    │
+│ • Optimistic CAS Version Check: Verifies seat version before updating. │
+│ • Inserts into bookings (status = 'HELD', expires_at = NOW() + 10m).   │
+│ • Inserts into booking_seats (defended by partial unique index).       │
+│ • Database Transaction Commits -> User receives: HTTP 201 Created.    │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+         ┌─────────────────────────┴─────────────────────────┐
+         │                                                   │
+         ▼ (User Pays within 10 mins)                        ▼ (User Abandons / Stalls)
+┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+│ STAGE 4A: PAYMENT & CONFIRMATION     │  │ STAGE 4B: EXPIRATION SWEEP           │
+│ (payment_5)                          │  │ (background_6)                       │
+├──────────────────────────────────────┤  ├──────────────────────────────────────┤
+│ 1. Idempotency Check:                │  │ 1. Autonomous worker sweeps every 5s │
+│    Client sends Idempotency-Key.     │  │    using:                            │
+│    Prevents duplicate card charges.  │  │    SELECT ... FOR UPDATE SKIP LOCKED │
+│ 2. Gateway Charge:                   │  │    WHERE status='HELD' AND expiry<NOW│
+│    Calls MockGateway.Charge().       │  │                                      │
+│ 3. The Race Arbiter (Row Lock):      │  │ 2. Releases event_seats to AVAILABLE │
+│    Locks booking row in PostgreSQL:  │  │ 3. Marks booking_seats as EXPIRED.   │
+│    • IF HELD & Valid:                │  │ 4. Updates bookings status to        │
+│      Transitions: HELD->PAID->CONFIRM│  │    EXPIRED (version + 1).            │
+│      Seat flipped to 'BOOKED'.       │  │                                      │
+│      User receives: TICKET CONFIRMED.│  │ Seat returns to available pool for   │
+│    • IF EXPIRED (User paid too late):│  │ other fans safely.                   │
+│      Arbiter catches state conflict. │  └──────────────────────────────────────┘
+│      Triggers automatic REFUND flow: │
+│      (REFUND_PENDING -> REFUNDED).   │
+│      Zero lost money without ticket. │
+└──────────────────────────────────────┘

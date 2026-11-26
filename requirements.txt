@@ -1,0 +1,78 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - REQUIREMENTS & SPECIFICATION
+================================================================================
+Document Status: APPROVED BASELINE
+Engineering Level: Google SDE-1 Standards
+Author: Engineering Team
+
+1. SYSTEM IDENTITY & DOMAIN
+--------------------------------------------------------------------------------
+A high-concurrency, backend-only VIP Concert & Flash Ticket Reservation Engine
+designed for extreme-demand flash drops (e.g., 50,000 users competing for 60 VIP
+seats at 11:00:00 AM).
+
+Workload Profiles:
+- Profile-Flash: 50,000 req over 1 sec (50,000 req/s impulse)
+- Profile-Burst: 50,000 req over 10 sec (5,000 req/s burst)
+- Profile-Sustained: 50,000 req over 60 sec (~833 req/s continuous)
+
+2. CORE FUNCTIONAL REQUIREMENTS
+--------------------------------------------------------------------------------
+FR-1: User Management & Authentication
+- User registration and login.
+- Stateless signed JWT authentication with short TTL (15 minutes).
+- Role-Based Access Control (RBAC):
+  * USER: Can book and manage their own reservations.
+  * OPERATOR: Operational tasks (view stats, inspect inventory).
+  * ADMIN: Dispute resolution, manual overrides with written reasons, refunds.
+  * SYSTEM: Internal trusted workers (expiration worker, reconciliation).
+
+FR-2: Event & Inventory Management
+- Event creation with two distinct inventory models:
+  * Model A (Reserved Seating): Specific seats (e.g., A1, A2, VIP tier).
+  * Model B (General Admission): Pooled capacity counter (e.g., 500 tickets).
+- Immutable physical seat definition distinct from dynamic reservation state.
+
+FR-3: Reservation Lifecycle (Finite State Machine)
+- Explicit states: HELD, PAID, CONFIRMED, EXPIRED, CANCELLED, DISPUTED, REFUND_PENDING, REFUNDED.
+- Authoritative hold duration: 10 minutes from reservation timestamp.
+- Strict state transition validation with authorized actor checks.
+
+FR-4: Financial Integrity & Payment Simulation
+- Mock payment gateway supporting: success, failure, timeout, delayed response,
+  duplicate webhooks, and refunds.
+- Idempotency key requirement on all payment and transition mutations.
+- In-doubt payment tracking with automatic reconciliation.
+
+3. ANTI-ABUSE & SYSTEM RULES (FROM THE 25 MASTER SCENARIOS)
+--------------------------------------------------------------------------------
+[Scenario 18] Scalper Cart Hoarding Defense:
+- Maximum 1 active HELD booking per authenticated user at any time.
+- Attempting to reserve while an active hold exists returns HTTP 429 Too Many Requests.
+
+[Scenario 21] High-Speed Bot Script Defense:
+- Token-bucket rate limiting per IP and per User ID at edge middleware.
+- Pre-sale gating: Requests arriving even 1ms before sale start timestamp are rejected
+  with HTTP 403 (Sale Not Started).
+- Idempotency fingerprinting to discard rapid multi-threaded replay attacks.
+
+[Scenario 24] Seat Recycling & Hoarding Loop Prevention:
+- Cooldown jitter on cancelled seats: A cancelled seat is not immediately re-acquirable
+  by the same user/IP for a randomized window (5-30s) to prevent perpetual cycling.
+
+[Scenario 14] Administrative Override Policy:
+- Administrative state transitions require ADMIN role JWT.
+- Mandatory non-empty written reason string stored in the audit trail.
+- Generates an immutable, linked audit record.
+
+[Scenario 10] Tamper-Evident Cryptographic Audit History:
+- Every state transition appends an immutable record to the audit ledger.
+- SHA-256 hash chaining: Hash_n = SHA256(Hash_(n-1) + BookingID + State + Actor + Timestamp).
+- Application database role granted INSERT and SELECT only (no UPDATE, no DELETE).
+
+4. NON-NEGOTIABLE CORRECTNESS INVARIANTS
+--------------------------------------------------------------------------------
+- Double-bookings: EXACTLY 0.
+- Over-allocation beyond capacity: EXACTLY 0.
+- Duplicate charges for same logical transaction: EXACTLY 0.
+- Stale or orphaned database locks after server crash: EXACTLY 0.

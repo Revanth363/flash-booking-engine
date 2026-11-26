@@ -1,0 +1,45 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - BACKGROUND WORKERS & RECONCILIATION
+================================================================================
+Document Status: IMPLEMENTED & VERIFIED (Google SDE-1 Standards)
+Module: background_6/
+
+1. AUTONOMOUS RESERVATION EXPIRATION WORKER (Scenario 6 & 15)
+--------------------------------------------------------------------------------
+Purpose:
+Identifies abandoned HELD reservations and safely restores inventory back to the pool.
+
+Cadence & Batching:
+- Runs every 5 seconds.
+- Bounded batch size (LIMIT 20) to prevent locking the entire bookings table.
+- Non-blocking lock acquisition:
+  SELECT booking_id FROM bookings 
+  WHERE status = 'HELD' AND expires_at < clock_timestamp() 
+  ORDER BY expires_at ASC LIMIT 20 FOR UPDATE SKIP LOCKED;
+
+Worker Actions per Expired Booking:
+1. Reverts event_seats.status back to 'AVAILABLE'.
+2. Marks booking_seats.booking_status as 'EXPIRED'.
+3. Transitions bookings.status to 'EXPIRED' and increments version.
+4. Commits transaction and releases locks.
+
+2. PAYMENT RECONCILIATION WORKER (Scenario 13)
+--------------------------------------------------------------------------------
+Purpose:
+Resolves in-doubt payment transactions caused by gateway timeouts.
+
+Workflow:
+- Runs every 10 seconds.
+- Queries payments WHERE status = 'IN_DOUBT' LIMIT 10 FOR UPDATE SKIP LOCKED.
+- Inquires ground truth from gateway API: gateway.Inquire(payment_id).
+- Resolution paths:
+  * Case A: Gateway confirms SUCCESS and hold is valid -> Confirm booking.
+  * Case B: Gateway confirms SUCCESS but hold expired -> Trigger refund (REFUND_PENDING).
+  * Case C: Gateway confirms FAILED / ABANDONED -> Update payment to FAILED.
+
+3. CRASH RECOVERY & STATELESSNESS (FT-01)
+--------------------------------------------------------------------------------
+- Workers maintain zero in-memory state between iterations.
+- If worker crashes (SIGKILL / power loss), uncommitted transactions roll back.
+- Upon process restart, the worker queries the authoritative database clock
+  (clock_timestamp()) and automatically resumes sweeping remaining expired records.

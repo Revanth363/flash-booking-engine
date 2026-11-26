@@ -1,0 +1,54 @@
+================================================================================
+FLASH BOOKING ENGINE (FBE) - CONCURRENCY ENGINE & DEADLOCK ELIMINATION
+================================================================================
+Document Status: IMPLEMENTED & VERIFIED (Google SDE-1 Standards)
+Module: concurrency_4/
+
+1. MULTI-SEAT CANONICAL LOCK ORDERING (Scenario 2 & 9)
+--------------------------------------------------------------------------------
+Problem:
+User X requests [A1, A2]. User Y simultaneously requests [A2, A1].
+If Transaction X locks A1 and waits for A2, while Transaction Y locks A2 and waits
+for A1, a circular wait deadlock occurs (PostgreSQL Error 40P01: deadlock_detected).
+
+Implementation:
+The Go MultiSeatAllocator sorts all requested seat IDs lexicographically:
+  sort.Strings(sortedSeatIDs)
+Both transactions are forced to lock seats in strict alphabetical order:
+  Step 1: Attempt to lock A1
+  Step 2: Attempt to lock A2
+User X locks A1 and A2. User Y fails fast on A1 via NOWAIT.
+Circular wait deadlocks on seat locks are mathematically eliminated.
+
+2. PESSIMISTIC ROW-LEVEL LOCKING (SELECT FOR UPDATE NOWAIT)
+--------------------------------------------------------------------------------
+When acquiring seats:
+  SELECT status, version FROM event_seats WHERE event_seat_id = $1 FOR UPDATE NOWAIT;
+- Winning transaction acquires the exclusive row lock immediately (< 2ms).
+- Contested transactions encounter PostgreSQL error 55P03 (lock_not_available)
+  and abort instantly with HTTP 409 Conflict without blocking in DB lock memory.
+
+3. OPTIMISTIC CONCURRENCY CONTROL (CAS VERSION GUARD)
+--------------------------------------------------------------------------------
+When updating seat status from AVAILABLE to HELD:
+  UPDATE event_seats 
+  SET status = 'HELD', version = version + 1, updated_at = CURRENT_TIMESTAMP 
+  WHERE event_seat_id = $1 AND version = $expected_version;
+Verifies that no concurrent modification occurred between the read and the commit.
+
+4. GENERAL ADMISSION (GA) ATOMIC CAPACITY DECREMENT (Scenario 4 & 5)
+--------------------------------------------------------------------------------
+Problem:
+1,000 users competing for the last 1 remaining ticket in a standing area pool.
+
+Implementation:
+Single-statement atomic conditional update:
+  UPDATE ga_inventory 
+  SET reserved_count = reserved_count + $qty, version = version + 1 
+  WHERE category_id = $cat_id 
+    AND (total_capacity - reserved_count - confirmed_count) >= $qty;
+- PostgreSQL executes this update sequentially on the shared inventory row.
+- Exactly 1 transaction satisfies the condition and increments the counter.
+- The remaining 999 transactions evaluate remaining == 0, resulting in
+  RowsAffected == 0, and return HTTP 409 Sold Out immediately.
+- Enforced at disk level by CHECK (reserved_count + confirmed_count <= total_capacity).
