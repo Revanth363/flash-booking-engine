@@ -114,10 +114,6 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type contextKey string
-
-const UserContextKey contextKey = "authenticated_user"
-
 func AuthMiddleware(authService *services.AuthService) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,13 +134,13 @@ func AuthMiddleware(authService *services.AuthService) func(http.Handler) http.H
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), UserContextKey, claims)
+			ctx := context.WithValue(r.Context(), services.UserContextKey, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
 func GetAuthenticatedUser(ctx context.Context) (*services.UserClaims, bool) {
-	claims, ok := ctx.Value(UserContextKey).(*services.UserClaims)
+	claims, ok := ctx.Value(services.UserContextKey).(*services.UserClaims)
 	return claims, ok
 }

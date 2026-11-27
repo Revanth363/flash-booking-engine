@@ -2,12 +2,14 @@ package payment
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"flash-booking-engine/application_2/domain"
 	"flash-booking-engine/application_2/repository"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,6 +38,21 @@ type ProcessPaymentResult struct {
 }
 
 func (s *PaymentService) ProcessPayment(ctx context.Context, req ChargeRequest) (*ProcessPaymentResult, error) {
+	reqBytes, _ := json.Marshal(req)
+	reqHash := HashPayload(reqBytes)
+
+	// Check Idempotency Key first (ADR-06: return cached response if retried)
+	record, err := s.idempMgr.AcquireOrGet(ctx, req.UserID, req.IdempotencyKey, "/api/v1/payments/charge", reqHash, 24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	if record != nil && record.Status == "COMPLETED" {
+		var cachedResult ProcessPaymentResult
+		if err := json.Unmarshal([]byte(record.ResponseBody), &cachedResult); err == nil {
+			return &cachedResult, nil
+		}
+	}
+
 	chargeResp, err := s.gateway.Charge(ctx, req)
 	if err != nil {
 		if err == ErrGatewayTimeout {
@@ -61,7 +78,7 @@ func (s *PaymentService) ProcessPayment(ctx context.Context, req ChargeRequest) 
 		return nil, fmt.Errorf("fetch booking for payment: %w", err)
 	}
 
-	paymentID := fmt.Sprintf("pay-%d", time.Now().UnixNano())
+	paymentID := uuid.NewString()
 
 	if booking.Status != domain.StatusHeld || booking.IsExpiredAt(time.Now()) {
 		_, _ = tx.Exec(ctx, `
@@ -70,12 +87,17 @@ func (s *PaymentService) ProcessPayment(ctx context.Context, req ChargeRequest) 
 			paymentID, req.BookingID, chargeResp.GatewayTransactionID, req.AmountCents, req.Currency, req.PaymentMethod,
 		)
 
-		refundID := fmt.Sprintf("rfnd-%d", time.Now().UnixNano())
+		refundID := uuid.NewString()
 		_, _ = tx.Exec(ctx, `
 			INSERT INTO refunds (refund_id, payment_id, amount_cents, status, reason, created_at, updated_at) 
 			VALUES ($1, $2, $3, 'REFUND_PENDING', 'Payment settled after hold expiration or cancellation', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);`,
 			refundID, paymentID, req.AmountCents,
 		)
+
+		_, _ = tx.Exec(ctx, `
+			UPDATE bookings 
+			SET status = 'REFUND_PENDING', version = version + 1, updated_at = CURRENT_TIMESTAMP 
+			WHERE booking_id = $1;`, req.BookingID)
 
 		_ = tx.Commit(ctx)
 
@@ -86,13 +108,18 @@ func (s *PaymentService) ProcessPayment(ctx context.Context, req ChargeRequest) 
 			Reason:               "Auto-refund: hold window expired",
 		})
 
-		return &ProcessPaymentResult{
+		refundResult := &ProcessPaymentResult{
 			PaymentID:            paymentID,
 			BookingID:            req.BookingID,
 			Status:               "REFUND_TRIGGERED",
 			GatewayTransactionID: chargeResp.GatewayTransactionID,
 			RefundTriggered:      true,
-		}, nil
+		}
+
+		respBytes, _ := json.Marshal(refundResult)
+		_ = s.idempMgr.Complete(ctx, req.UserID, req.IdempotencyKey, 200, string(respBytes), req.BookingID)
+
+		return refundResult, nil
 	}
 
 	err = s.bookingRepo.UpdateBookingStatus(ctx, tx, req.BookingID, domain.StatusPaid, booking.Version)
@@ -128,10 +155,15 @@ func (s *PaymentService) ProcessPayment(ctx context.Context, req ChargeRequest) 
 		return nil, fmt.Errorf("commit payment transaction: %w", err)
 	}
 
-	return &ProcessPaymentResult{
+	finalResult := &ProcessPaymentResult{
 		PaymentID:            paymentID,
 		BookingID:            req.BookingID,
 		Status:               "CONFIRMED",
 		GatewayTransactionID: chargeResp.GatewayTransactionID,
-	}, nil
+	}
+
+	respBytes, _ := json.Marshal(finalResult)
+	_ = s.idempMgr.Complete(ctx, req.UserID, req.IdempotencyKey, 200, string(respBytes), req.BookingID)
+
+	return finalResult, nil
 }

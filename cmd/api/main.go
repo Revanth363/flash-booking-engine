@@ -57,7 +57,7 @@ func main() {
 	logger.Info("connected to PostgreSQL connection pool successfully")
 
 	userRepo := repository.NewUserRepository(pool)
-	authService := services.NewAuthService(userRepo, jwtSecret, 15*time.Minute)
+	authService := services.NewAuthService(userRepo, jwtSecret, 24*time.Hour)
 	authHandler := api.NewAuthHandler(authService)
 
 	bookingRepo := repository.NewBookingRepository(pool)
@@ -66,7 +66,8 @@ func main() {
 
 	mockGateway := payment.NewMockGateway(payment.ModeSuccess)
 	idempMgr := payment.NewIdempotencyManager(pool)
-	_ = payment.NewPaymentService(pool, bookingRepo, mockGateway, idempMgr)
+	paymentService := payment.NewPaymentService(pool, bookingRepo, mockGateway, idempMgr)
+	paymentHandler := payment.NewPaymentHandler(paymentService, logger)
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
@@ -84,6 +85,7 @@ func main() {
 
 	authMiddleware := api.AuthMiddleware(authService)
 	mux.Handle("POST /api/v1/bookings/hold", authMiddleware(http.HandlerFunc(bookingHandler.ReserveSeat)))
+	mux.Handle("POST /api/v1/payments/charge", authMiddleware(http.HandlerFunc(paymentHandler.ProcessPayment)))
 
 	server := &http.Server{
 		Addr:         ":8080",

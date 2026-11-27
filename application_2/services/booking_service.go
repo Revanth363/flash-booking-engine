@@ -9,6 +9,7 @@ import (
 	"flash-booking-engine/application_2/domain"
 	"flash-booking-engine/application_2/repository"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -56,7 +57,7 @@ func (s *BookingService) ReserveSeat(ctx context.Context, userID, eventID, seatI
 
 	now := time.Now()
 	booking := &domain.Booking{
-		BookingID:        fmt.Sprintf("bkg-%d", now.UnixNano()),
+		BookingID:        uuid.NewString(),
 		UserID:           userID,
 		EventID:          eventID,
 		Status:           domain.StatusHeld,

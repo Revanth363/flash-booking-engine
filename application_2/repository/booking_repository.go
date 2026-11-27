@@ -7,6 +7,7 @@ import (
 
 	"flash-booking-engine/application_2/domain"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -95,7 +96,7 @@ func (r *BookingRepository) HoldSeat(ctx context.Context, booking *domain.Bookin
 		INSERT INTO booking_seats (booking_seat_id, booking_id, event_seat_id, booking_status, price_cents, created_at) 
 		VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP);`
 
-	bookingSeatID := booking.BookingID + "-seat"
+	bookingSeatID := uuid.NewString()
 	_, err = tx.Exec(ctx, insertSeatQuery,
 		bookingSeatID,
 		booking.BookingID,

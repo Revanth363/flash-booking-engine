@@ -13,6 +13,7 @@ import (
 	"flash-booking-engine/application_2/repository"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -35,6 +36,10 @@ func NewAuthService(repo *repository.UserRepository, jwtSecret string, accessTTL
 	}
 }
 
+type contextKey string
+
+const UserContextKey contextKey = "authenticated_user"
+
 type TokenPair struct {
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
@@ -53,7 +58,7 @@ func (s *AuthService) Register(ctx context.Context, name, email, password, phone
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
-	userID := fmt.Sprintf("usr-%d", time.Now().UnixNano())
+	userID := uuid.NewString()
 	user := &domain.User{
 		UserID:       userID,
 		Name:         name,
@@ -114,7 +119,7 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (*Token
 	h.Write([]byte(refreshTokenStr))
 	tokenHash := hex.EncodeToString(h.Sum(nil))
 
-	tokenID := fmt.Sprintf("tok-%d", now.UnixNano())
+	tokenID := uuid.NewString()
 	err = s.userRepo.StoreRefreshToken(ctx, tokenID, user.UserID, tokenHash, now.Add(7*24*time.Hour))
 	if err != nil {
 		return nil, nil, fmt.Errorf("store refresh token: %w", err)

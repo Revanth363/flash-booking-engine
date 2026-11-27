@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,7 +66,7 @@ func (m *IdempotencyManager) AcquireOrGet(ctx context.Context, userID, key, path
 		return nil, fmt.Errorf("check idempotency key: %w", err)
 	}
 
-	idempotencyID := fmt.Sprintf("idmp-%d", time.Now().UnixNano())
+	idempotencyID := uuid.NewString()
 	insertQuery := `
 		INSERT INTO idempotency_keys (idempotency_id, user_id, idempotency_key, request_path, request_hash, status, created_at, expires_at) 
 		VALUES ($1, $2, $3, $4, $5, 'IN_PROGRESS', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + $6::interval);`
